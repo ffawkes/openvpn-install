@@ -122,7 +122,8 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 			read -p "Do you really want to remove OpenVPN? [y/N]: " -e REMOVE
 			if [[ "$REMOVE" = 'y' || "$REMOVE" = 'Y' ]]; then
 				PORT=$(grep '^port ' /etc/openvpn/server.conf | cut -d " " -f 2)
-				PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2)
+				PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2 | tr -d 6)
+				IP6_PREFIX=$(grep '^server-ipv6 ' /etc/openvpn/server.conf | cut -d " " -f 2)
 				if pgrep firewalld; then
 					IP=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24 -j SNAT --to ' | cut -d " " -f 10)
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
@@ -132,6 +133,14 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
 					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
 					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
+
+					if [[ ! -z $IP6_PREFIX ]]; then
+						firewall-cmd --zone=trusted --remove-source=$IP6_PREFIX
+						firewall-cmd --permanent --zone=trusted --remove-source=$IP6_PREFIX
+						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s $IP6_PREFIX -j MASQUERADE
+						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s $IP6_PREFIX -j MASQUERADE
+					fi
+
 				else
 					IP=$(grep 'iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to ' $RCLOCAL | cut -d " " -f 14)
 					iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
@@ -144,6 +153,20 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 						sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
 						sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
 					fi
+
+					if [[ ! -z $IP6_PREFIX ]]; then
+						ip6tables -t nat -D POSTROUTING -s $IP6_PREFIX -j MASQUERADE
+						sed -i "\~ip6tables -t nat -A POSTROUTING -s $IP6_PREFIX -j MASQUERADE~d" $RCLOCAL
+						if ip6tables -L -n | grep -qE '^ACCEPT'; then
+							ip6tables -D INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
+							ip6tables -D FORWARD -s $IP6_PREFIX -j ACCEPT
+							ip6tables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+							sed -i "/ip6tables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
+							sed -i "\~ip6tables -I FORWARD -s $IP6_PREFIX -j ACCEPT~d" $RCLOCAL
+							sed -i "/ip6tables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
+						fi
+					fi
+
 				fi
 				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$PORT" != '1194' ]]; then
 					semanage port -d -t openvpn_port_t -p $PROTOCOL $PORT
@@ -185,6 +208,10 @@ else
 		echo "This server is behind NAT. What is the public IPv4 address or hostname?"
 		read -p "Public IP address / hostname: " -e PUBLICIP
 	fi
+	echo
+	echo "If you want to enable IPv6 support, provide an IPv6 prefix for OpenVPN (eg: 2001:db8::/112)."
+	echo "Otherwise, just leave the next field blank."
+	read -p "IPv6 prefix: " -e IP6_PREFIX
 	echo
 	echo "Which protocol do you want for OpenVPN connections?"
 	echo "   1) UDP (recommended)"
@@ -255,8 +282,12 @@ YdEIqUuyyOP7uWrat2DX9GgdT0Kj3jlN9K5W7edjcrsZCwenyO4KbXCeAvzhzffi
 ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 -----END DH PARAMETERS-----' > /etc/openvpn/dh.pem
 	# Generate server.conf
+	OVPN_PROTOCOL=$PROTOCOL
+	if [[ ! -z $IP6_PREFIX ]]; then
+	    OVPN_PROTOCOL="$PROTOCOL"6
+	fi
 	echo "port $PORT
-proto $PROTOCOL
+proto $OVPN_PROTOCOL
 dev tun
 sndbuf 0
 rcvbuf 0
@@ -269,6 +300,10 @@ tls-auth ta.key 0
 topology subnet
 server 10.8.0.0 255.255.255.0
 ifconfig-pool-persist ipp.txt" > /etc/openvpn/server.conf
+	if [[ ! -z $IP6_PREFIX ]]; then
+		echo "server-ipv6 $IP6_PREFIX" >> /etc/openvpn/server.conf
+		echo 'push "route-ipv6 2000::/3"' >> /etc/openvpn/server.conf
+	fi
 	echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server.conf
 	# DNS
 	case $DNS in
@@ -315,6 +350,14 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/30-openvpn-forward.conf
 	# Enable without waiting for a reboot or service restart
 	echo 1 > /proc/sys/net/ipv4/ip_forward
+
+	if [[ ! -z $IP6_PREFIX ]]; then
+		# Enable net.ipv6.conf.all.forwarding for the system
+		echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/30-openvpn-forward.conf
+		# Enable without waiting for a reboot or service restart
+		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+	fi
+
 	if pgrep firewalld; then
 		# Using both permanent and not permanent rules to avoid a firewalld
 		# reload.
@@ -327,6 +370,13 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 		# Set NAT for the VPN subnet
 		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
 		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
+		# IPv6 routing
+		if [[ ! -z $IP6_PREFIX ]]; then
+			firewall-cmd --zone=trusted --add-source=$IP6_PREFIX
+			firewall-cmd --permanent --zone=trusted --add-source=$IP6_PREFIX
+			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s $IP6_PREFIX -j MASQUERADE
+			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s $IP6_PREFIX -j MASQUERADE
+		fi
 	else
 		# Needed to use rc.local with some systemd distros
 		if [[ "$OS" = 'debian' && ! -e $RCLOCAL ]]; then
@@ -347,6 +397,24 @@ exit 0' > $RCLOCAL
 			sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
 			sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
 			sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
+		fi
+		# IPv6 routing
+		if [[ ! -z $IP6_PREFIX ]]; then
+			ip6tables -t nat -A POSTROUTING -s $IP6_PREFIX -j MASQUERADE
+			sed -i "1 a\ip6tables -t nat -A POSTROUTING -s $IP6_PREFIX -j MASQUERADE" $RCLOCAL
+
+			if ip6tables -L -n | grep -qE '^(REJECT|DROP)'; then
+				# If ip6tables has at least one REJECT rule, we asume this is needed.
+				# Not the best approach but I can't think of other and this shouldn't
+				# cause problems.
+				ip6tables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
+				ip6tables -I FORWARD -s $IP6_PREFIX -j ACCEPT
+				ip6tables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+				sed -i "1 a\ip6tables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
+				sed -i "1 a\ip6tables -I FORWARD -s $IP6_PREFIX -j ACCEPT" $RCLOCAL
+				sed -i "1 a\ip6tables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
+			fi
+
 		fi
 	fi
 	# If SELinux is enabled and a custom port was selected, we need this
